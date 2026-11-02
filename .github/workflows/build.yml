@@ -1,0 +1,553 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p $HOME/proj && cd $HOME/proj
+          mkdir -p $(dirname 'app/build.gradle.kts')
+          cat > 'app/build.gradle.kts' <<'PENNY_EOF_0'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.scanner.penny"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.scanner.penny"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.10" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.8.2")
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jsoup:jsoup:1.17.2")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+          }
+          PENNY_EOF_0
+          mkdir -p $(dirname 'app/src/main/AndroidManifest.xml')
+          cat > 'app/src/main/AndroidManifest.xml' <<'PENNY_EOF_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <application
+                  android:label="ماسح الأسهم"
+                  android:icon="@android:drawable/ic_menu_search"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".ScanService" android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+              </application>
+          </manifest>
+          PENNY_EOF_1
+          mkdir -p $(dirname 'app/src/main/java/com/scanner/penny/Analyzer.kt')
+          cat > 'app/src/main/java/com/scanner/penny/Analyzer.kt' <<'PENNY_EOF_2'
+          package com.scanner.penny
+
+          import kotlin.math.min
+
+          object Analyzer {
+              private val pos = listOf("fda", "approval", "approves", "contract", "merger", "acquisition", "acquire",
+                  "partnership", "patent", "breakthrough", "awarded", "phase 2", "phase 3", "earnings beat",
+                  "guidance", "compliance", "purchase order", "launch", "collaboration")
+              private val neg = listOf("offering", "reverse split", "warrant", "dilution", "delist", "bankruptcy",
+                  "going concern", "lawsuit", "investigation", "halt", "registered direct", "private placement")
+
+              fun build(t: String, s: Snap, news: List<String>): Candidate {
+                  val txt = news.joinToString(" ").lowercase()
+                  val hasPos = pos.any { txt.contains(it) }
+                  val negHits = neg.filter { txt.contains(it) }
+                  val dollarVol = s.last * s.dayVol
+
+                  val stage = when {
+                      s.change >= 60 -> "LATE"
+                      s.spike >= Config.SPIKE_PCT || (s.spike >= 7 && s.surge >= 3) -> "EXPLOSION"
+                      s.spike >= 4 && s.surge >= 2 -> "EARLY"
+                      else -> "WATCH"
+                  }
+                  var score = min(40.0, s.spike * 2.5) + min(20.0, s.surge * 4) +
+                      min(15.0, dollarVol / 1e6 * 3) + min(10.0, s.change / 3) +
+                      (if (hasPos) 15 else if (news.isNotEmpty()) 5 else 0)
+                  if (negHits.isNotEmpty()) score -= 20
+                  if (stage == "LATE") score -= 15
+
+                  val entry = s.last
+                  var stop = s.swingLow * 0.99
+                  if ((entry - stop) / entry > 0.12) stop = entry * 0.88
+                  if ((entry - stop) / entry < 0.03) stop = entry * 0.97
+                  val risk = entry - stop
+                  val riskCash = Config.CAPITAL * Config.RISK_PCT / 100
+                  val shares = minOf((riskCash / risk).toInt(), (Config.CAPITAL / entry).toInt())
+
+                  val warn = buildList {
+                      if (negHits.isNotEmpty()) add("⚠️ خبر فيه كلمات خطر: " + negHits.joinToString(", "))
+                      if (news.isEmpty()) add("حركة بدون خبر ظاهر (محفز غير معروف)")
+                      if (stage == "LATE") add("⚠️ صاعد أكثر من 60% — خطر مطاردة القمة")
+                  }.joinToString("\n")
+
+                  return Candidate(
+                      ticker = t, price = s.last, change = s.change, dollarVol = dollarVol, spike = s.spike,
+                      surge = s.surge, stage = stage, score = score.toInt().coerceIn(0, 100),
+                      entry = entry, stop = stop, t1 = entry + 1.5 * risk, t2 = entry + 2.5 * risk,
+                      t3 = entry + 4 * risk, resist = s.dayHigh, shares = shares, news = news, warn = warn
+                  )
+              }
+          }
+          PENNY_EOF_2
+          mkdir -p $(dirname 'app/src/main/java/com/scanner/penny/Config.kt')
+          cat > 'app/src/main/java/com/scanner/penny/Config.kt' <<'PENNY_EOF_3'
+          package com.scanner.penny
+
+          object Config {
+              const val MIN_PRICE = 0.30        // أقل سعر
+              const val SCAN_SECONDS = 60L      // كل كم ثانية يمسح
+              const val WINDOW_MIN = 30         // نافذة قياس الانفجار (دقائق)
+              const val SPIKE_PCT = 15.0        // صعود % خلال النافذة = انفجار
+              const val TOP_N = 12              // عدد الأسهم في القائمة
+              const val CAPITAL = 1000.0        // رأس المال (للحاسبة والتجريبي)
+              const val RISK_PCT = 1.0          // أقصى مخاطرة للصفقة % من رأس المال
+              const val DAILY_LOSS_R = 3.0      // يوقف التنبيهات إذا خسر التجريبي 3R في اليوم
+              const val ALERT_COOLDOWN_MIN = 30 // ما يكرر تنبيه نفس السهم قبل كذا
+              const val ALWAYS_SCAN = false     // true = يمسح حتى والسوق مغلق (للتجربة)
+          }
+          PENNY_EOF_3
+          mkdir -p $(dirname 'app/src/main/java/com/scanner/penny/MainActivity.kt')
+          cat > 'app/src/main/java/com/scanner/penny/MainActivity.kt' <<'PENNY_EOF_4'
+          package com.scanner.penny
+
+          import android.Manifest
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalLayoutDirection
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.LayoutDirection
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  PaperBook.init(this)
+                  ScannerState.paper.value = PaperBook.summary()
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  setContent { MaterialTheme(colorScheme = darkColorScheme()) { Screen() } }
+              }
+          }
+
+          @Composable
+          fun Screen() {
+              val ctx = LocalContext.current
+              val running by ScannerState.running.collectAsState()
+              val status by ScannerState.status.collectAsState()
+              val list by ScannerState.list.collectAsState()
+              val paper by ScannerState.paper.collectAsState()
+
+              CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                  Column(Modifier.fillMaxSize().background(Color(0xFF0E1116)).padding(start = 12.dp, end = 12.dp, top = 28.dp)) {
+                      Text("ماسح الأسهم تحت 20$", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                      Text(status, fontSize = 13.sp, color = Color(0xFF9CA3AF))
+                      Text(paper, fontSize = 12.sp, color = Color(0xFF9CA3AF))
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 8.dp)) {
+                          Button(onClick = {
+                              val i = Intent(ctx, ScanService::class.java)
+                              if (running) ctx.stopService(i) else ContextCompat.startForegroundService(ctx, i)
+                          }) { Text(if (running) "إيقاف" else "تشغيل") }
+                          OutlinedButton(onClick = {
+                              ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                                  .setData(Uri.parse("package:${ctx.packageName}")))
+                          }) { Text("استثناء البطارية") }
+                      }
+                      LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          items(list) { Card(it) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Card(c: Candidate) {
+              val (label, color) = when (c.stage) {
+                  "EXPLOSION" -> "🚀 انفجار" to Color(0xFF22C55E)
+                  "EARLY" -> "👀 مبكر" to Color(0xFFEAB308)
+                  "LATE" -> "⚠️ متأخر" to Color(0xFFEF4444)
+                  else -> "مراقبة" to Color(0xFF9CA3AF)
+              }
+              ElevatedCard(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(12.dp)) {
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                          Text("${c.ticker}  ${px(c.price)}$", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                          Text("$label  ${c.score}", color = color, fontWeight = FontWeight.Bold)
+                      }
+                      Text("اليوم %+.1f%% | آخر ${Config.WINDOW_MIN}د %+.1f%% | حجم ×%.1f | سيولة %.1fM$"
+                          .format(java.util.Locale.US, c.change, c.spike, c.surge, c.dollarVol / 1e6), fontSize = 12.sp)
+                      Text("دخول ${px(c.entry)} | وقف ${px(c.stop)} | كمية ${c.shares}", fontSize = 13.sp)
+                      Text("أهداف ${px(c.t1)} / ${px(c.t2)} / ${px(c.t3)} | مقاومة ${px(c.resist)}", fontSize = 13.sp)
+                      c.news.forEach { Text("📰 $it", fontSize = 12.sp, color = Color(0xFFBFDBFE)) }
+                      if (c.warn.isNotEmpty()) Text(c.warn, fontSize = 12.sp, color = Color(0xFFF87171))
+                  }
+              }
+          }
+          PENNY_EOF_4
+          mkdir -p $(dirname 'app/src/main/java/com/scanner/penny/Models.kt')
+          cat > 'app/src/main/java/com/scanner/penny/Models.kt' <<'PENNY_EOF_5'
+          package com.scanner.penny
+
+          import kotlinx.coroutines.flow.MutableStateFlow
+
+          data class Snap(
+              val last: Double, val change: Double, val dayHigh: Double, val swingLow: Double,
+              val spike: Double, val surge: Double, val dayVol: Double
+          )
+
+          data class Candidate(
+              val ticker: String, val price: Double, val change: Double, val dollarVol: Double,
+              val spike: Double, val surge: Double, val stage: String, val score: Int,
+              val entry: Double, val stop: Double, val t1: Double, val t2: Double, val t3: Double,
+              val resist: Double, val shares: Int, val news: List<String>, val warn: String
+          )
+
+          object ScannerState {
+              val running = MutableStateFlow(false)
+              val status = MutableStateFlow("متوقف")
+              val list = MutableStateFlow<List<Candidate>>(emptyList())
+              val paper = MutableStateFlow("")
+          }
+          PENNY_EOF_5
+          mkdir -p $(dirname 'app/src/main/java/com/scanner/penny/PaperBook.kt')
+          cat > 'app/src/main/java/com/scanner/penny/PaperBook.kt' <<'PENNY_EOF_6'
+          package com.scanner.penny
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.time.LocalDate
+          import java.time.ZoneId
+
+          /** سجل تداول وهمي: كل تنبيه يُسجَّل كصفقة ويُقاس هل ضرب الهدف الأول أو الوقف. */
+          object PaperBook {
+              private lateinit var sp: SharedPreferences
+              fun init(c: Context) { if (!::sp.isInitialized) sp = c.getSharedPreferences("paper", 0) }
+
+              private fun load() = JSONArray(sp.getString("t", "[]"))
+              private fun save(a: JSONArray) = sp.edit().putString("t", a.toString()).apply()
+              private fun all() = load().let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
+
+              fun openTickers() = all().filter { it.getBoolean("open") }.map { it.getString("s") }
+
+              fun open(c: Candidate) {
+                  if (openTickers().contains(c.ticker)) return
+                  val a = load()
+                  a.put(JSONObject().put("s", c.ticker).put("e", c.entry).put("sl", c.stop).put("t1", c.t1)
+                      .put("open", true).put("r", 0.0).put("ts", System.currentTimeMillis()).put("ct", 0L))
+                  save(a)
+              }
+
+              fun update(prices: Map<String, Double>) {
+                  val a = load()
+                  val now = System.currentTimeMillis()
+                  for (i in 0 until a.length()) {
+                      val o = a.getJSONObject(i)
+                      if (!o.getBoolean("open")) continue
+                      val p = prices[o.getString("s")] ?: continue
+                      val e = o.getDouble("e"); val risk = e - o.getDouble("sl")
+                      val r = when {
+                          p <= o.getDouble("sl") -> -1.0
+                          p >= o.getDouble("t1") -> 1.5
+                          now - o.getLong("ts") > 24 * 3600_000L -> (p - e) / risk
+                          else -> continue
+                      }
+                      o.put("open", false).put("r", r).put("ct", now)
+                  }
+                  save(a)
+              }
+
+              fun todayR(): Double {
+                  val start = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                  return all().filter { !it.getBoolean("open") && it.getLong("ct") >= start }.sumOf { it.getDouble("r") }
+              }
+
+              fun summary(): String {
+                  val l = all(); val closed = l.filter { !it.getBoolean("open") }
+                  val wins = closed.count { it.getDouble("r") > 0 }
+                  val rate = if (closed.isEmpty()) 0 else wins * 100 / closed.size
+                  val sum = closed.sumOf { it.getDouble("r") }
+                  return "📒 تجريبي: ${closed.size} صفقة | نجاح $rate% | إجمالي %.1fR | مفتوحة ${l.size - closed.size} | اليوم %.1fR"
+                      .format(java.util.Locale.US, sum, todayR())
+              }
+          }
+          PENNY_EOF_6
+          mkdir -p $(dirname 'app/src/main/java/com/scanner/penny/ScanService.kt')
+          cat > 'app/src/main/java/com/scanner/penny/ScanService.kt' <<'PENNY_EOF_7'
+          package com.scanner.penny
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import kotlinx.coroutines.*
+          import java.time.DayOfWeek
+          import java.time.ZoneId
+          import java.time.ZonedDateTime
+          import java.util.Locale
+
+          fun px(v: Double): String = String.format(Locale.US, if (v < 1) "%.3f" else "%.2f", v)
+
+          class ScanService : Service() {
+              private var job: Job? = null
+              private val lastAlert = mutableMapOf<String, Long>()
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  PaperBook.init(applicationContext)
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("svc", "الخدمة", NotificationManager.IMPORTANCE_LOW))
+                  nm.createNotificationChannel(NotificationChannel("alerts", "تنبيهات الأسهم", NotificationManager.IMPORTANCE_HIGH))
+                  val n = NotificationCompat.Builder(this, "svc").setSmallIcon(android.R.drawable.ic_menu_search)
+                      .setContentTitle("ماسح الأسهم يعمل").setOngoing(true).build()
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  else startForeground(1, n)
+                  ScannerState.running.value = true
+                  if (job == null) job = CoroutineScope(Dispatchers.IO).launch { loop() }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  job?.cancel(); job = null
+                  ScannerState.running.value = false
+                  ScannerState.status.value = "متوقف"
+              }
+
+              private fun marketOpen(): Boolean {
+                  if (Config.ALWAYS_SCAN) return true
+                  val t = ZonedDateTime.now(ZoneId.of("America/New_York"))
+                  if (t.dayOfWeek == DayOfWeek.SATURDAY || t.dayOfWeek == DayOfWeek.SUNDAY) return false
+                  return (t.hour * 60 + t.minute) in 240 until 1200 // 4:00ص – 8:00م نيويورك
+              }
+
+              private suspend fun loop() {
+                  while (currentCoroutineContext().isActive) {
+                      if (!marketOpen()) {
+                          ScannerState.status.value = "السوق مغلق (يعمل 4:00ص–8:00م نيويورك)"
+                      } else {
+                          try { scanOnce() } catch (e: CancellationException) { throw e }
+                          catch (e: Exception) { ScannerState.status.value = "خطأ: ${e.message}" }
+                      }
+                      delay(Config.SCAN_SECONDS * 1000)
+                  }
+              }
+
+              private fun scanOnce() {
+                  ScannerState.status.value = "جاري المسح…"
+                  val tickers = Finviz.scan()
+                  if (tickers.isEmpty()) { ScannerState.status.value = "ما وصلت بيانات من Finviz (حظر مؤقت أو تغيّر الصفحة)"; return }
+
+                  val snaps = tickers.take(25).mapNotNull { t -> Yahoo.chart(t)?.let { t to it } }
+                      .filter { it.second.last >= Config.MIN_PRICE && it.second.last < 20.0 }
+                  val top = snaps.sortedByDescending { it.second.spike + it.second.change / 2 }.take(Config.TOP_N)
+                  val list = top.map { (t, s) -> Analyzer.build(t, s, Yahoo.news(t)) }.sortedByDescending { it.score }
+                  ScannerState.list.value = list
+
+                  // تحديث الصفقات التجريبية المفتوحة
+                  val prices = PaperBook.openTickers().mapNotNull { t -> Yahoo.chart(t)?.let { t to it.last } }.toMap()
+                  PaperBook.update(prices)
+                  ScannerState.paper.value = PaperBook.summary()
+
+                  val now = System.currentTimeMillis()
+                  if (PaperBook.todayR() <= -Config.DAILY_LOSS_R) {
+                      ScannerState.status.value = "⛔ وصلت حد الخسارة اليومي (التجريبي) — التنبيهات موقوفة اليوم"
+                      return
+                  }
+                  for (c in list) {
+                      val hot = c.stage == "EXPLOSION" || c.stage == "EARLY"
+                      val cooled = now - (lastAlert[c.ticker] ?: 0L) > Config.ALERT_COOLDOWN_MIN * 60_000L
+                      if (hot && cooled) {
+                          lastAlert[c.ticker] = now
+                          PaperBook.open(c)
+                          alert(c)
+                      }
+                  }
+                  ScannerState.paper.value = PaperBook.summary()
+                  ScannerState.status.value = "آخر مسح: ${list.size} سهم قيد المتابعة"
+              }
+
+              private fun alert(c: Candidate) {
+                  val tag = if (c.stage == "EXPLOSION") "🚀 انفجار" else "👀 بداية حركة"
+                  val body = "${c.ticker} ${px(c.price)}$ | ${"%+.0f".format(Locale.US, c.spike)}% خلال ${Config.WINDOW_MIN}د | سكور ${c.score}\n" +
+                      "دخول ${px(c.entry)} | وقف ${px(c.stop)}\n" +
+                      "أهداف ${px(c.t1)} / ${px(c.t2)} / ${px(c.t3)} | الكمية ${c.shares}\n" +
+                      (c.news.firstOrNull() ?: "لا خبر") + (if (c.warn.isNotEmpty()) "\n" + c.warn else "")
+                  val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  val n = NotificationCompat.Builder(this, "alerts").setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentTitle("$tag ${c.ticker}").setContentText(body.lines().first())
+                      .setStyle(NotificationCompat.BigTextStyle().bigText(body)).setContentIntent(pi)
+                      .setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH).build()
+                  getSystemService(NotificationManager::class.java).notify(c.ticker.hashCode(), n)
+              }
+          }
+          PENNY_EOF_7
+          mkdir -p $(dirname 'app/src/main/java/com/scanner/penny/Sources.kt')
+          cat > 'app/src/main/java/com/scanner/penny/Sources.kt' <<'PENNY_EOF_8'
+          package com.scanner.penny
+
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import org.json.JSONObject
+          import org.jsoup.Jsoup
+          import org.jsoup.parser.Parser
+          import java.util.concurrent.TimeUnit
+
+          object Http {
+              private val client = OkHttpClient.Builder()
+                  .connectTimeout(15, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).build()
+
+              fun get(url: String): String? = try {
+                  val req = Request.Builder().url(url)
+                      .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36")
+                      .header("Accept-Language", "en-US,en;q=0.9").build()
+                  client.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
+              } catch (e: Exception) { null }
+          }
+
+          object Finviz {
+              // أسهم تحت 20$، صاعدة 3%+، حجم نسبي 1.5x+، متوسط حجم 100K+ — مرتبة بالأعلى صعودًا
+              private const val BASE = "https://finviz.com/screener.ashx?v=111&f=sh_price_u20,ta_change_u3,sh_relvol_o1.5,sh_avgvol_o100&o=-change&r="
+
+              fun scan(): List<String> {
+                  val out = linkedSetOf<String>()
+                  for (start in listOf(1, 21, 41)) {
+                      val html = Http.get(BASE + start) ?: break
+                      val doc = Jsoup.parse(html)
+                      val links = doc.select("a.screener-link-primary")
+                      if (links.isEmpty()) break
+                      links.forEach { out.add(it.text().trim()) }
+                      Thread.sleep(800)
+                  }
+                  return out.filter { it.isNotEmpty() && it.length <= 5 }
+              }
+          }
+
+          object Yahoo {
+              fun chart(sym: String): Snap? {
+                  val js = Http.get("https://query1.finance.yahoo.com/v8/finance/chart/$sym?interval=1m&range=1d&includePrePost=true") ?: return null
+                  return try {
+                      val r = JSONObject(js).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+                      val q = r.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0)
+                      fun arr(n: String): List<Double?> {
+                          val a = q.getJSONArray(n)
+                          return (0 until a.length()).map { if (a.isNull(it)) null else a.getDouble(it) }
+                      }
+                      val c = arr("close"); val l = arr("low"); val h = arr("high"); val v = arr("volume")
+                      val idx = c.indices.filter { c[it] != null && l[it] != null && h[it] != null && v[it] != null }
+                      if (idx.size < 15) return null
+                      val cl = idx.map { c[it]!! }; val lo = idx.map { l[it]!! }
+                      val hi = idx.map { h[it]!! }; val vo = idx.map { v[it]!! }
+                      val last = cl.last()
+                      val back = cl[maxOf(0, cl.size - 1 - Config.WINDOW_MIN)]
+                      val prev = r.getJSONObject("meta").optDouble("chartPreviousClose", Double.NaN)
+                          .let { if (it.isNaN() || it <= 0) cl.first() else it }
+                      val recent = vo.takeLast(3).average()
+                      val base = vo.dropLast(3).takeLast(30).average()
+                      Snap(
+                          last = last, change = (last / prev - 1) * 100, dayHigh = hi.max(),
+                          swingLow = lo.takeLast(10).min(), spike = (last / back - 1) * 100,
+                          surge = if (base > 0) recent / base else 0.0, dayVol = vo.sum()
+                      )
+                  } catch (e: Exception) { null }
+              }
+
+              fun news(sym: String): List<String> {
+                  val x = Http.get("https://feeds.finance.yahoo.com/rss/2.0/headline?s=$sym&region=US&lang=en-US") ?: return emptyList()
+                  return try {
+                      Jsoup.parse(x, "", Parser.xmlParser()).select("item > title").take(3).map { it.text() }
+                  } catch (e: Exception) { emptyList() }
+              }
+          }
+          PENNY_EOF_8
+          mkdir -p $(dirname 'build.gradle.kts')
+          cat > 'build.gradle.kts' <<'PENNY_EOF_9'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          PENNY_EOF_9
+          mkdir -p $(dirname 'gradle.properties')
+          cat > 'gradle.properties' <<'PENNY_EOF_10'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          kotlin.code.style=official
+          PENNY_EOF_10
+          mkdir -p $(dirname 'settings.gradle.kts')
+          cat > 'settings.gradle.kts' <<'PENNY_EOF_11'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "PennyScanner"
+          include(":app")
+          PENNY_EOF_11
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+      - name: Build
+        working-directory: /home/runner/proj
+        run: gradle assembleRelease --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PennyScanner-APK
+          path: /home/runner/proj/app/build/outputs/apk/release/*.apk
